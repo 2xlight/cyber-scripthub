@@ -1,9 +1,9 @@
 import requests
 
-url = input("Input URL: ")
-Session = input("Input session: ")
-TrackingId = input("Input TrackingID: ")
-username = input("Input username: ")
+url = input("Input URL: ").strip()
+Session = input("Input session: ").strip()
+TrackingId = input("Input TrackingID: ").strip()
+username = input("Input username: ").strip()
 
 #keep alive
 SESSION = requests.Session()
