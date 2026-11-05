@@ -12,7 +12,7 @@ declare -A LIST_INPUT_DEFAULT   # tool nào cần input là FILE list thay vì t
 
 # ================= HÀM DÙNG CHUNG =================
 
-timestamp() { date +"%Y%m%d_%H%M%S"; }
+timestamp() { date +"%Y%m%d_%H%M%S%N"; }
 
 get_target_dir() {
     local safe="${1//[^A-Za-z0-9_-]/_}"

@@ -5,15 +5,8 @@ set -uo pipefail
 RESULTS_DIR="results"
 declare -A QUICKHELP   # mỗi phase script tự thêm entry riêng sau khi source
 
-timestamp() { date +"%Y%m%d_%H%M%S"; }
+timestamp() { date +"%Y%m%d_%H%M%S%N"; }
 
-# QUAN TRỌNG: khác với new_target_dir() ở 01 (tạo thư mục MỚI kèm
-# timestamp mỗi lần chạy), hàm này trả về CÙNG 1 thư mục cho 1 target,
-# không có timestamp. Lý do: phase 03 cần đọc lại file output của
-# phase 02, phase 04/05 cần đọc lại output của 02/03... nếu mỗi lần
-# chạy ra 1 thư mục khác nhau thì phase sau không tìm thấy gì cả.
-# Timestamp vẫn được giữ lại ở TÊN FILE (xem confirm_and_run) để
-# không mất lịch sử các lần chạy.
 get_target_dir() {
     local safe
     safe=$(echo "$1" | tr '/: ' '___')
@@ -22,7 +15,6 @@ get_target_dir() {
     echo "$dir"
 }
 
-# TODO: mở rộng regex nếu cần (xem ghi chú ở recon_framework.sh bản 01)
 validate_target() {
     local target="$1"
     [[ -n "$target" ]]
@@ -44,14 +36,14 @@ confirm_and_run() {
     local cmd="$1"
     local outfile="$2"
     echo
-    echo "Lệnh:"
+    echo "Command > "
     echo "  $cmd"
-    read -rp "Chạy lệnh này? [Y/n] > " confirm
+    read -rp "Running? [Y/n] > " confirm
     if [[ "$confirm" =~ ^[Yy]$|^$ ]]; then
         eval "$cmd" | tee "$outfile"
-        echo "> Đã lưu: $outfile"
+        echo "Saved > $outfile"
     else
-        echo "> Bỏ qua."
+        echo "> Pass."
     fi
 }
 
