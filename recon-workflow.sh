@@ -146,7 +146,7 @@ QUICKHELP[dnsx]="-silent | -a -resp (in IP) | -cname | -wc (lọc wildcard)"
 QUICKHELP[httpx]="-silent | -sc -td -title | -fr (follow redirect) | -mc 200,302 | -threads 50"
 QUICKHELP[naabu]="-p - (full port) | -top-ports 1000 | -l <file> | -c <n>"
 QUICKHELP[feroxbuster]="-w <wordlist> | -x php,txt,html | -d <depth> | -C 404,403 | --silent"
-# TODO: thêm entry khi bạn viết preset cho tool còn lại (xem README.md)
+QUICKHELP[arjun]="-m GET|POST | -w <params_wordlist> | -i <file_urls> -oT <out>"
 
 # ================= LIST-INPUT TOOLS =================
 # Tool nào cần 1 FILE danh sách (không phải target đơn) thì khai tên
